@@ -60,12 +60,12 @@ namespace CdkEcsFargateBlueGreen.Infra
                         Account = awsAccountId,
                         Region = region
                     },
-                    EnableCodeDeployBlueGreenHook = true,
+                    DeploymentType = DeploymentType.BlueGreen,
                     VpcId = vpcId,
                     SecurityGroupId = securityGroupId,
                     LoadBalancerArn = loadBalancerArn,
                     ClusterArn = clusterArn,
-                    ClusterName = clusterName
+                    ClusterName = clusterName,
                 });
             }
 

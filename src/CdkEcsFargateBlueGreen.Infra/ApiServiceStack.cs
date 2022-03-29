@@ -1,4 +1,5 @@
-﻿using Amazon.CDK;
+﻿using System;
+using Amazon.CDK;
 using Amazon.CDK.AWS.CloudWatch;
 using Amazon.CDK.AWS.EC2;
 using Amazon.CDK.AWS.ECS;
@@ -6,6 +7,7 @@ using Amazon.CDK.AWS.ElasticLoadBalancingV2;
 using Amazon.CDK.AWS.IAM;
 using Amazon.CDK.AWS.Logs;
 using System.Collections.Generic;
+using System.Text;
 using HealthCheck = Amazon.CDK.AWS.ElasticLoadBalancingV2.HealthCheck;
 using Protocol = Amazon.CDK.AWS.ElasticLoadBalancingV2.Protocol;
 
@@ -18,7 +20,7 @@ namespace CdkEcsFargateBlueGreen.Infra
         public string LoadBalancerArn { get; set; }
         public string ClusterName { get; set; }
         public string ClusterArn { get; set; }
-        public bool EnableCodeDeployBlueGreenHook { get; set; }
+        public DeploymentType DeploymentType { get; set; }
     }
     
     public class ApiServiceStack : Stack
@@ -151,6 +153,7 @@ namespace CdkEcsFargateBlueGreen.Infra
                 })
             });
 
+
             //
             // ECS Resources: task definition, service, task set, etc -
             //
@@ -165,7 +168,7 @@ namespace CdkEcsFargateBlueGreen.Infra
             {
                 LogGroupName = "api-logs",
                 RemovalPolicy = RemovalPolicy.DESTROY,
-                Retention = RetentionDays.ONE_DAY
+                Retention = RetentionDays.ONE_WEEK
             });
 
             // Note:
@@ -183,7 +186,11 @@ namespace CdkEcsFargateBlueGreen.Infra
                 Environment = new Dictionary<string, string>
                 {
                     {"ENVIRONMENT", "Test" },
-                    {"BLUE_GREEN", "Plz" }
+                    {"BLUE_GREEN", "YPlz" }
+                },
+                DockerLabels = new Dictionary<string, string>
+                {
+                    {"DeploymentModel", props.DeploymentType.ToString()}
                 }
             });
             container.AddPortMappings(new PortMapping { ContainerPort = 80 });
@@ -199,11 +206,6 @@ namespace CdkEcsFargateBlueGreen.Infra
                 PropagateTags = PropagatedTagSource.SERVICE.ToString(),
             });
             service.ApplyRemovalPolicy(RemovalPolicy.DESTROY);
-
-            service.Node.AddDependency(blueTargetGroup);
-            service.Node.AddDependency(greenTargetGroup);
-            service.Node.AddDependency(productionListener);
-            service.Node.AddDependency(testListener);
 
             var taskSet = new CfnTaskSet(this, "api-task-set", new CfnTaskSetProps
             {
@@ -249,7 +251,7 @@ namespace CdkEcsFargateBlueGreen.Infra
             //
             // CodeDeploy hook, IAM role and cloud formation transform to configure the blue-green deployments
             //
-            
+
             var codeDeployServiceRole = new Role(this, "api-code-deploy-service-role", new RoleProps
             {
                 AssumedBy = new ServicePrincipal("codedeploy.amazonaws.com"),
@@ -282,36 +284,78 @@ namespace CdkEcsFargateBlueGreen.Infra
 
             // Note:
             // If performing non-ECS resource changes, e.g those resources not directly referenced by the blue-green hook:
-            // 1. Temporarily disable the hook
+            // 1. Temporarily disable the hook (DeploymentType.RollingUpdateSafe).
             // 2. Deploy the non-ECS resource changes
-            // 3. Reenable the hook and redeploy the stack
-            if (props.EnableCodeDeployBlueGreenHook)
+            // 3. Change the deployment type to (DeploymentType.RollingUpdateUnsafe)
+            // 4. Deploy the stack
+            // 5. Reenable the hook and redeploy the stack (DeploymentType.BlueGreen)
+            switch (props.DeploymentType)
             {
-                this.AddTransform("AWS::CodeDeployBlueGreen");
+                case DeploymentType.RollingUpdateSafe:
+                    
+                    // Note:
+                    // When performing a rolling update,
+                    // this will ensure the new Task is registered with ECS and attached to the BLUE target group
+                    // prior to the listener rules being updated.
+                    // This is very important to avoid a potential outage!
+                    productionListener.Node.AddDependency(taskSet);
+                    productionListener.Node.AddDependency(service);
+                    productionListener.Node.AddDependency(primaryTaskSet);
+                    testListener.Node.AddDependency(taskSet);
+                    testListener.Node.AddDependency(service);
+                    testListener.Node.AddDependency(primaryTaskSet);
+                    
+                    break;
+                case DeploymentType.RollingUpdateUnsafe:
 
-                var taskDefinitionLogicalId = this.GetLogicalId(taskDefinition.Node.DefaultChild as CfnTaskDefinition);
-                var taskSetLogicalId = this.GetLogicalId(taskSet);
+                    var builder = new StringBuilder();
+                    builder.AppendLine("WARNING: DeploymentType.RollingUpdateUnsafe may lead to an outage!");
+                    builder.AppendLine("Depending on the current stack state, if the ECS service is not currently attached to the BLUE target group you WILL cause an OUTAGE.");
+                    builder.AppendLine("Ensure the stack has been deployed with DeploymentType.RollingUpdateSafe prior to deploying the stack in this state.");
+                    builder.AppendLine("Alternatively, it is safe to proceed if the ECS service is already attached to the BLUE target group.");
+                    Annotations.Of(this).AddWarning(builder.ToString());
 
-                var blueGreenHook = new CfnCodeDeployBlueGreenHook(this, "api-service-code-deploy-blue-green-hook", new CfnCodeDeployBlueGreenHookProps
-                {
-                    TrafficRoutingConfig = new CfnTrafficRoutingConfig
+                    // Note:
+                    // This simply sets the service dependencies on the stack back
+                    // into a state where they are compatible with a blue/green deployment.
+                    service.Node.AddDependency(blueTargetGroup);
+                    service.Node.AddDependency(greenTargetGroup);
+                    service.Node.AddDependency(productionListener);
+                    service.Node.AddDependency(testListener);
+
+                    break;
+                case DeploymentType.BlueGreen:
+
+                    service.Node.AddDependency(blueTargetGroup);
+                    service.Node.AddDependency(greenTargetGroup);
+                    service.Node.AddDependency(productionListener);
+                    service.Node.AddDependency(testListener);
+
+                    this.AddTransform("AWS::CodeDeployBlueGreen");
+
+                    var taskDefinitionLogicalId = this.GetLogicalId(taskDefinition.Node.DefaultChild as CfnTaskDefinition);
+                    var taskSetLogicalId = this.GetLogicalId(taskSet);
+
+                    var blueGreenHook = new CfnCodeDeployBlueGreenHook(this, "api-service-code-deploy-blue-green-hook", new CfnCodeDeployBlueGreenHookProps
                     {
-                        TimeBasedCanary = new CfnTrafficRoutingTimeBasedCanary
+                        TrafficRoutingConfig = new CfnTrafficRoutingConfig
                         {
-                            // Shift 20% of prod traffic, then wait 1 minute
-                            StepPercentage = 20,
-                            BakeTimeMins = 1,
+                            TimeBasedCanary = new CfnTrafficRoutingTimeBasedCanary
+                            {
+                                // Shift 20% of prod traffic, then wait 1 minute
+                                StepPercentage = 20,
+                                BakeTimeMins = 1,
+                            },
+                            Type = CfnTrafficRoutingType.TIME_BASED_CANARY
                         },
-                        Type = CfnTrafficRoutingType.TIME_BASED_CANARY
-                    },
-                    AdditionalOptions = new CfnCodeDeployBlueGreenAdditionalOptions
-                    {
-                        // After canary period, shift 100% of prod traffic, then wait 1 minute before terminating the old tasks
-                        TerminationWaitTimeInMinutes = 1
-                    },
-                    ServiceRole = this.GetLogicalId(codeDeployServiceRole.Node.DefaultChild as CfnRole),
-                    Applications = new ICfnCodeDeployBlueGreenApplication[]
-                    {
+                        AdditionalOptions = new CfnCodeDeployBlueGreenAdditionalOptions
+                        {
+                            // After canary period, shift 100% of prod traffic, then wait 1 minute before terminating the old tasks
+                            TerminationWaitTimeInMinutes = 1
+                        },
+                        ServiceRole = this.GetLogicalId(codeDeployServiceRole.Node.DefaultChild as CfnRole),
+                        Applications = new ICfnCodeDeployBlueGreenApplication[]
+                        {
                         new CfnCodeDeployBlueGreenApplication
                         {
                             Target = new CfnCodeDeployBlueGreenApplicationTarget
@@ -336,8 +380,7 @@ namespace CdkEcsFargateBlueGreen.Infra
                                     ProdTrafficRoute = new CfnTrafficRoute
                                     {
                                         Type = CfnListener.CFN_RESOURCE_TYPE_NAME,
-                                        LogicalId = this.GetLogicalId(
-                                            productionListener.Node.DefaultChild as CfnListener)
+                                        LogicalId = this.GetLogicalId(productionListener.Node.DefaultChild as CfnListener)
                                     },
                                     TestTrafficRoute = new CfnTrafficRoute
                                     {
@@ -352,8 +395,10 @@ namespace CdkEcsFargateBlueGreen.Infra
                                 }
                             }
                         },
-                    }
-                });
+                        }
+                    });
+
+                    break;
             }
 
             // Note:
@@ -366,5 +411,12 @@ namespace CdkEcsFargateBlueGreen.Infra
                 Default = vpc.VpcId
             });
         }
+    }
+
+    public enum DeploymentType
+    {
+        RollingUpdateSafe,
+        RollingUpdateUnsafe,
+        BlueGreen
     }
 }
